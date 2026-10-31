@@ -6,15 +6,15 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-st.set_page_config(layout="wide", page_title="실시간 단타/스윙 스크리너")
+st.set_page_config(layout="wide", page_title="국내주식 세력 매집 포착 스크리너")
 
 @st.cache_data(ttl=300)
 def get_market_universe():
     try:
         df = fdr.StockListing('KOSDAQ')
-        top_100 = df.sort_values(by="Amount", ascending=False).head(100)
-        return top_100
+        return df.sort_values(by="Amount", ascending=False).head(100)
     except:
         return pd.DataFrame()
 
@@ -34,171 +34,140 @@ def get_naver_supply(ticker):
                 frgn_val = int(frgn_str) if frgn_str.lstrip('-').isdigit() else 0
                 inst_val = int(inst_str) if inst_str.lstrip('-').isdigit() else 0
                 return frgn_val, inst_val
-    except:
-        pass
+    except: pass
     return 0, 0
 
-def get_recent_news(ticker):
-    url = f"https://finance.naver.com/item/news_news.naver?code={ticker}"
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    try:
-        res = requests.get(url, headers=headers, timeout=2)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        links = soup.select('.title a')
-        titles = [link.text.strip() for link in links[:3]]
-        return " / ".join(titles) if titles else "최신 뉴스 없음"
-    except:
-        return "뉴스 로딩 실패"
-
 @st.cache_data(ttl=300)
-def run_screener(universe_df):
+def run_stock_accumulation_screener(universe_df):
     temp_results = []
-    progress_text = "네이버 금융 연동: 차트 및 수급 분석 중..."
+    progress_text = "네이버 금융 연동: 차트 매집 및 수급 분석 중..."
     my_bar = st.progress(0, text=progress_text)
     
-    today = datetime.today()
-    start_date = (today - timedelta(days=40)).strftime("%Y-%m-%d")
-    
+    start_date = (datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d")
     tickers = universe_df['Code'].tolist()
     names = universe_df['Name'].tolist()
     
     for i, ticker in enumerate(tickers):
         try:
             df = fdr.DataReader(ticker, start_date)
-            if len(df) < 20: 
-                my_bar.progress((i + 1) / len(tickers), text=progress_text)
-                continue
-                
-            df['SMA_5'] = df['Close'].rolling(window=5).mean()
-            df['SMA_20'] = df['Close'].rolling(window=20).mean()
-            df['Volume_Ratio'] = df['Volume'] / df['Volume'].rolling(window=5).mean()
+            if len(df) < 30: continue
             
-            expected_sma5 = df['Close'].tail(4).mean()
+            # 지표 1: 볼린저 밴드
+            df['SMA_20'] = df['Close'].rolling(window=20).mean()
+            df['STD_20'] = df['Close'].rolling(window=20).std()
+            df['BB_Upper'] = df['SMA_20'] + (df['STD_20'] * 2)
+            df['BB_Lower'] = df['SMA_20'] - (df['STD_20'] * 2)
+            df['Band_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['SMA_20']
+            
+            # 지표 2: OBV (누적 거래량)
+            delta = df['Close'].diff()
+            direction = delta.apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+            df['OBV'] = (df['Volume'] * direction).cumsum()
             
             latest = df.iloc[-1]
-            ticker_name = names[i]
+            recent_10 = df.tail(10)
+            price_trend = (recent_10['Close'].iloc[-1] - recent_10['Close'].iloc[0]) / recent_10['Close'].iloc[0]
+            obv_trend = recent_10['OBV'].iloc[-1] > recent_10['OBV'].iloc[0]
             
-            is_trend = latest['SMA_5'] > latest['SMA_20']
-            is_volume = latest['Volume_Ratio'] > 1.5
+            # 조건 판단
+            is_bb_squeeze = latest['Band_Width'] < 0.15 # 밴드폭 15% 이내 극도 응축
+            is_obv_accum = price_trend <= 0.05 and obv_trend # 가격 횡보/하락 중 OBV 상승
             
-            if is_trend or is_volume:
+            score = 0
+            matched = []
+            
+            if is_bb_squeeze: 
+                matched.append("밴드밀집(응축)")
+                score += 30
+            if is_obv_accum: 
+                matched.append("OBV 매집")
+                score += 30
+            
+            # 밴드폭이 좁고 기본 매집 조건이 하나라도 맞을 때만 수급(외인/기관) 추가 확인
+            if score >= 30 and latest['Band_Width'] < 0.20:
                 f_net, i_net = get_naver_supply(ticker)
-                
-                supply_score = 0
-                supply_status = []
-                if f_net > 0: supply_score += 15; supply_status.append("외인(매수)")
-                if i_net > 0: supply_score += 15; supply_status.append("기관(매수)")
+                if f_net > 0: 
+                    matched.append("외인(매수)")
+                    score += 20
+                if i_net > 0: 
+                    matched.append("기관(매수)")
+                    score += 20
                     
-                momentum_score = min(latest['Volume_Ratio'] * 10, 40)
-                trend_score = 30 if is_trend else 0
-                total_score = momentum_score + trend_score + supply_score
-                
-                matched_conditions = []
-                if is_trend: matched_conditions.append("이평선 정배열")
-                if is_volume: matched_conditions.append("거래량 급증")
-                if supply_status: matched_conditions.append("수급 유입")
-                
                 temp_results.append({
                     "종목코드": ticker,
-                    "종목명": ticker_name,
-                    "만족조건": ", ".join(matched_conditions),
+                    "종목명": names[i],
+                    "만족조건": ", ".join(matched),
                     "현재가": int(latest['Close']),
-                    "내일예상타점": int(expected_sma5),
-                    "볼륨비율": round(latest['Volume_Ratio'], 2),
-                    "수급상태": ", ".join(supply_status) if supply_status else "-",
-                    "종합점수": round(total_score, 1)
+                    "밴드폭": round(latest['Band_Width'] * 100, 2),
+                    "종합점수": score
                 })
-        except:
-            pass 
-            
+        except: pass
+        
         time.sleep(0.01)
         my_bar.progress((i + 1) / len(tickers), text=progress_text)
         
-    if not temp_results:
-        my_bar.empty()
-        return pd.DataFrame()
-
-    temp_df = pd.DataFrame(temp_results).sort_values(by="종합점수", ascending=False).head(20).reset_index(drop=True)
-    for i, row in temp_df.iterrows():
-        temp_df.at[i, '최신뉴스'] = get_recent_news(row['종목코드'])
-        
     my_bar.empty()
-    return temp_df
+    if not temp_results: return pd.DataFrame()
+    return pd.DataFrame(temp_results).sort_values(by=["종합점수", "밴드폭"], ascending=[False, True]).head(15).reset_index(drop=True)
 
-def draw_chart(ticker, ticker_name):
+def draw_stock_chart(ticker, ticker_name):
     start_date = (datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d")
     df = fdr.DataReader(ticker, start_date)
-    df['SMA_5'] = df['Close'].rolling(window=5).mean()
+    
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
-    expected_sma5 = df['Close'].tail(4).mean()
+    df['STD_20'] = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['SMA_20'] + (df['STD_20'] * 2)
+    df['BB_Lower'] = df['SMA_20'] - (df['STD_20'] * 2)
     
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='주가', increasing_line_color='red', decreasing_line_color='blue'))
-    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_5'], line=dict(color='orange', width=2), name='5일선'))
-    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], line=dict(color='green', width=2), name='20일선'))
+    delta = df['Close'].diff()
+    df['OBV'] = (df['Volume'] * delta.apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))).cumsum()
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
     
-    next_day = df.index[-1] + timedelta(days=1)
-    if next_day.weekday() >= 5: next_day += timedelta(days=(7-next_day.weekday()))
-    fig.add_trace(go.Scatter(x=[df.index[-1], next_day], y=[expected_sma5, expected_sma5], line=dict(color='purple', width=2, dash='dot'), name='내일 예상 5일선'))
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='주가', increasing_line_color='red', decreasing_line_color='blue'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], line=dict(color='gray', width=1, dash='dot'), name='BB 상단'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], line=dict(color='gray', width=1, dash='dot'), name='BB 하단', fill='tonexty', fillcolor='rgba(128,128,128,0.1)'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], line=dict(color='orange', width=2), name='20일선'), row=1, col=1)
     
-    fig.update_layout(title=f"📈 {ticker_name} ({ticker}) 실시간 캔들 차트", yaxis_title="가격 (원)", xaxis_rangeslider_visible=False, height=400, template="plotly_white", margin=dict(l=0, r=0, t=40, b=0))
+    fig.add_trace(go.Scatter(x=df.index, y=df['OBV'], line=dict(color='purple', width=2), name='OBV (누적 거래량)'), row=2, col=1)
+    
+    fig.update_layout(title=f"📈 {ticker_name} ({ticker}) 매집 포착 정밀 차트", yaxis_title="가격 (원)", yaxis2_title="OBV", xaxis_rangeslider_visible=False, height=600, template="plotly_white", margin=dict(l=0, r=0, t=40, b=0))
     return fig
 
-st.title("🚀 실시간 단타/스윙 공략주 스크리너 (풀오토 시나리오)")
-st.markdown("추천 종목 표 아래에서 원하는 종목을 선택하면, **영웅문S# 주식자동감시주문**에 바로 입력할 수 있는 기계적 매매 시나리오를 제시합니다.")
+st.title("🕵️‍♂️ 국내주식 폭풍전야 매집 포착 스크리너")
+st.markdown("차트가 조용히 횡보할 때(볼린저 밴드 밀집), **누군가 물량을 매집하며 외인/기관의 수급이 들어오는 종목**을 한발 앞서 찾아냅니다.")
 
-if st.button("현재 기준 스크리닝 실행", type="primary"):
+if st.button("주식 매집 탐지 시작", type="primary"):
     st.session_state['run_screener'] = True
 
 if st.session_state.get('run_screener', False):
     universe_df = get_market_universe()
     if not universe_df.empty:
-        result_df = run_screener(universe_df)
+        result_df = run_stock_accumulation_screener(universe_df)
         
         if not result_df.empty:
-            st.subheader("🎯 실시간 진입 추천 종목 Top 20")
-            st.dataframe(result_df.style.highlight_max(axis=0, subset=['종합점수', '볼륨비율'], color='#ff4b4b').format({"현재가": "{:,}", "내일예상타점": "{:,}"}), use_container_width=True)
-            
-            st.divider()
-            st.subheader("📊 차트 확인 및 영웅문S# 자동 매매 세팅 가이드")
+            st.dataframe(result_df.style.highlight_max(axis=0, subset=['종합점수'], color='#ff4b4b').format({"현재가": "{:,}", "밴드폭": "{:.1f}%"}), use_container_width=True)
             
             stock_options = [f"{row['종목명']} ({row['종목코드']})" for i, row in result_df.iterrows()]
-            selected_stock = st.selectbox("공략할 종목을 선택하세요:", stock_options)
+            selected_stock = st.selectbox("정밀 차트 분석할 종목을 선택하세요:", stock_options)
             
             sel_name = selected_stock.split(" (")[0]
             sel_code = selected_stock.split(" (")[1].replace(")", "")
             
-            target_expected = int(result_df[result_df['종목코드'] == sel_code]['내일예상타점'].values[0])
             current_price = result_df[result_df['종목코드'] == sel_code]['현재가'].values[0]
+            bb_width = result_df[result_df['종목코드'] == sel_code]['밴드폭'].values[0]
             
-            # 익절/손절가 계산
-            take_profit = int(target_expected * 1.05)
-            stop_loss = int(target_expected * 0.97)
-            
-            col1, col2 = st.columns([2, 1])
+            col1, col2 = st.columns([3, 1])
             with col1:
-                st.plotly_chart(draw_chart(sel_code, sel_name), use_container_width=True)
+                st.plotly_chart(draw_stock_chart(sel_code, sel_name), use_container_width=True)
             with col2:
-                st.success(f"**진입 타점 (내일 5일선):** {target_expected:,}원")
-                st.info(f"**목표 익절가 (+5%):** {take_profit:,}원")
-                st.error(f"**기계적 손절가 (-3%):** {stop_loss:,}원")
-            
-            st.markdown(f"""
-            ---
-            ### 📱 영웅문S# 그대로 따라하기 (본업 충실형 세팅)
-            앱 하단 **[주문]** ➡️ **[자동감시주문]** 메뉴 진입 후 아래 설정값을 입력하고 반드시 **'▶감시시작'**을 눌러두세요.
-
-            **1️⃣ [신규종목] 자동매수 세팅 (아침 장 시작 전 걸어두기)**
-            * **감시조건:** 주가가 **`{target_expected:,}원`** 이하일 때
-            * **주문설정:** 매수 / **`시장가`** (체결 보장) / 원하는 수량
-            * **효과:** 주가가 급등하지 않고 예상 5일선까지 예쁘게 눌려줄 때만 시스템이 낚아챕니다.
-
-            **2️⃣ [잔고편입종목] 자동매도 세팅 (미리 켜두면 평생 유지)**
-            * **감시조건:** 
-              * 📈 이익실현: 매입단가 대비 **`+5%`** 도달 시
-              * 📉 손실제한: 매입단가 대비 **`-3%`** 도달 시
-            * **주문설정:** 매도 / **`시장가`** / 100% (또는 익절 50%)
-            * **효과:** 1번 조건으로 매수 체결 즉시, 감정이 배제된 익절/손절 라인이 자동 가동됩니다.
-            """)
+                st.info(f"**현재가:** {current_price:,}원")
+                st.warning(f"**현재 밴드폭:** {bb_width}%")
+                st.markdown(f"""
+                **💡 영웅문S# 매집주 세팅 가이드**
+                1. **자동매수:** {current_price:,}원 부근 (밴드 하단선 분할 진입)
+                2. **자동매도 (익절):** 밴드 상단 강하게 돌파 시 (+5% 이상)
+                3. **자동매도 (손절):** 20일선 이탈 후 회복 실패 시 (-3%)
+                """)
         else:
-            st.warning("조건을 만족하는 종목이 없습니다.")
+            st.warning("현재 완벽한 매집 조건을 충족하는 주식이 없습니다.")
