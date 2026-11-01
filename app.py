@@ -8,13 +8,14 @@ import time
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-st.set_page_config(layout="wide", page_title="국내주식 세력 매집 & 지표 통합 스크리너")
+st.set_page_config(layout="wide", page_title="국내주식 스윙 타점 & 매집 통합 스크리너")
 
 @st.cache_data(ttl=300)
 def get_market_universe():
     try:
+        # 거래대금 상위 150종목 추출 (유동성 부족한 잡주 필터링)
         df = fdr.StockListing('KOSDAQ')
-        return df.sort_values(by="Amount", ascending=False).head(100)
+        return df.sort_values(by="Amount", ascending=False).head(150)
     except:
         return pd.DataFrame()
 
@@ -35,9 +36,9 @@ def get_naver_supply(ticker):
     return 0, 0
 
 @st.cache_data(ttl=300)
-def run_advanced_screener(universe_df):
+def run_stock_swing_screener(universe_df):
     temp_results = []
-    progress_text = "지표 종합 분석 중 (BB, OBV, MACD, RSI, 수급)..."
+    progress_text = "스윙 눌림목 및 외인/기관 수급 스캔 중..."
     my_bar = st.progress(0, text=progress_text)
     
     start_date = (datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d")
@@ -48,59 +49,54 @@ def run_advanced_screener(universe_df):
             df = fdr.DataReader(ticker, start_date)
             if len(df) < 30: continue
             
-            # 1. 볼린저 밴드
+            recent_30 = df.tail(30)
+            latest = df.iloc[-1]
+            
             df['SMA_20'] = df['Close'].rolling(window=20).mean()
             df['STD_20'] = df['Close'].rolling(window=20).std()
             df['BB_Upper'] = df['SMA_20'] + (df['STD_20'] * 2)
             df['BB_Lower'] = df['SMA_20'] - (df['STD_20'] * 2)
             df['Band_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['SMA_20']
             
-            # 2. OBV
             delta = df['Close'].diff()
             df['OBV'] = (df['Volume'] * delta.apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))).cumsum()
             
-            # 3. MACD
-            exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-            exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-            df['MACD'] = exp1 - exp2
-            df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-            
-            # 4. RSI (14일)
-            up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
-            rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
-            df['RSI'] = 100 - (100 / (1 + rs))
-            
-            latest = df.iloc[-1]
             recent_10 = df.tail(10)
+            price_trend = (recent_10['Close'].iloc[-1] - recent_10['Close'].iloc[0]) / recent_10['Close'].iloc[0]
+            obv_trend = recent_10['OBV'].iloc[-1] > recent_10['OBV'].iloc[0]
             
-            # 코어 조건 판단
             is_bb_squeeze = latest['Band_Width'] < 0.15
-            is_obv_accum = ((recent_10['Close'].iloc[-1] - recent_10['Close'].iloc[0]) / recent_10['Close'].iloc[0] <= 0.05) and (recent_10['OBV'].iloc[-1] > recent_10['OBV'].iloc[0])
+            is_obv_accum = price_trend <= 0.05 and obv_trend
+            
+            peak_high = recent_30['High'].max()
+            peak_vol = recent_30['Volume'].max()
+            
+            drop_rate = (latest['Close'] - peak_high) / peak_high if peak_high > 0 else 0
+            vol_dry_rate = latest['Volume'] / peak_vol if peak_vol > 0 else 1
+            
+            # 고점대비 10~40% 하락, 거래량 25% 이하로 급감, 20일선에서 크게 밀리지 않음
+            is_swing_dip = (-0.40 <= drop_rate <= -0.10) and (vol_dry_rate < 0.25) and (latest['Close'] > latest['SMA_20'] * 0.85)
             
             score = 0
             matched = []
             
-            # [기본 점수] 밴드 응축 및 OBV 매집
-            if is_bb_squeeze: matched.append("BB밀집"); score += 30
-            if is_obv_accum: matched.append("OBV매집"); score += 30
+            if is_swing_dip: matched.append("⭐거래량급감(스윙)"); score += 30
+            if is_bb_squeeze: matched.append("BB밀집"); score += 20
+            if is_obv_accum: matched.append("OBV매집"); score += 20
             
-            if score >= 30 and latest['Band_Width'] < 0.20:
-                # [가점 1] MACD 및 RSI 지표
-                if latest['MACD'] > latest['Signal']: matched.append("MACD(Up)"); score += 10
-                if 30 < latest['RSI'] < 55: matched.append("RSI(턴어라운드)"); score += 10
-                
-                # [가점 2] 실시간 수급
+            # 점수가 20점 이상일 때만 수급 확인 (크롤링 속도 저하 방어)
+            if score >= 20:
                 f_net, i_net = get_naver_supply(ticker)
-                if f_net > 0: matched.append("외인순매수"); score += 10
-                if i_net > 0: matched.append("기관순매수"); score += 10
-                    
+                if f_net > 0: matched.append("외인(매수)"); score += 15
+                if i_net > 0: matched.append("기관(매수)"); score += 15
+            
+            if score >= 30:
                 temp_results.append({
                     "종목코드": ticker,
                     "종목명": names[i],
                     "만족조건": ", ".join(matched),
                     "현재가": int(latest['Close']),
-                    "밴드폭": round(latest['Band_Width'] * 100, 2),
-                    "RSI": round(latest['RSI'], 1),
+                    "고점대비하락": f"{round(drop_rate*100, 1)}%",
                     "종합점수": score
                 })
         except: pass
@@ -109,19 +105,62 @@ def run_advanced_screener(universe_df):
         
     my_bar.empty()
     if not temp_results: return pd.DataFrame()
-    return pd.DataFrame(temp_results).sort_values(by=["종합점수", "밴드폭"], ascending=[False, True]).head(15).reset_index(drop=True)
+    return pd.DataFrame(temp_results).sort_values(by=["종합점수", "고점대비하락"], ascending=[False, True]).head(15).reset_index(drop=True)
 
-st.title("🏆 멀티 지표 스코어링 주식 스크리너")
-st.markdown("핵심 매집 신호(BB, OBV)에 **MACD, RSI, 외인/기관 수급**을 가점제로 결합하여 겹치는 지표가 많은 1순위 종목을 추출합니다.")
+def draw_chart(ticker, ticker_name):
+    start_date = (datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d")
+    df = fdr.DataReader(ticker, start_date)
+    
+    df['SMA_20'] = df['Close'].rolling(window=20).mean()
+    df['STD_20'] = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['SMA_20'] + (df['STD_20'] * 2)
+    df['BB_Lower'] = df['SMA_20'] - (df['STD_20'] * 2)
 
-if st.button("종합 지표 스크리닝 실행", type="primary"):
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='주가', increasing_line_color='red', decreasing_line_color='blue'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], line=dict(color='gray', width=1, dash='dot')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], line=dict(color='gray', width=1, dash='dot'), fill='tonexty', fillcolor='rgba(128,128,128,0.1)'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], line=dict(color='orange', width=2), name='20일선'), row=1, col=1)
+    
+    colors = ['red' if df['Close'].iloc[i] > df['Open'].iloc[i] else 'blue' for i in range(len(df))]
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='거래량'), row=2, col=1)
+    
+    fig.update_layout(title=f"📈 {ticker_name} ({ticker}) 스윙 타점 정밀 차트", yaxis_title="가격 (원)", yaxis2_title="거래량", xaxis_rangeslider_visible=False, height=550, template="plotly_white", margin=dict(l=0, r=0, t=40, b=0), showlegend=False)
+    return fig
+
+st.title("🎯 국내주식 스윙 타점 & 매집 통합 스크리너")
+st.markdown("코스닥 거래대금 상위 150개 주도주 중, **최근 급등 후 거래량이 씨가 마른 진짜 눌림목과 외인/기관의 매집**을 가점제로 추적합니다.")
+
+if st.button("스윙 & 매집 주식 탐지 시작", type="primary"):
     st.session_state['run_screener'] = True
 
 if st.session_state.get('run_screener', False):
     universe_df = get_market_universe()
     if not universe_df.empty:
-        result_df = run_advanced_screener(universe_df)
+        result_df = run_stock_swing_screener(universe_df)
         if not result_df.empty:
-            st.dataframe(result_df.style.highlight_max(axis=0, subset=['종합점수'], color='#ff4b4b').format({"현재가": "{:,}", "밴드폭": "{:.1f}%"}), use_container_width=True)
+            st.dataframe(result_df.style.highlight_max(axis=0, subset=['종합점수'], color='#ff4b4b').format({"현재가": "{:,}"}), use_container_width=True)
+            
+            stock_options = [f"{row['종목명']} ({row['종목코드']})" for i, row in result_df.iterrows()]
+            selected_stock = st.selectbox("정밀 차트 분석 (거래량 확인):", stock_options)
+            
+            sel_name = selected_stock.split(" (")[0]
+            sel_code = selected_stock.split(" (")[1].replace(")", "")
+            
+            current_price = result_df[result_df['종목코드'] == sel_code]['현재가'].values[0]
+            drop = result_df[result_df['종목코드'] == sel_code]['고점대비하락'].values[0]
+            matched_conds = result_df[result_df['종목코드'] == sel_code]['만족조건'].values[0]
+            
+            col1, col2 = st.columns([3, 1])
+            with col1: st.plotly_chart(draw_chart(sel_code, sel_name), use_container_width=True)
+            with col2: 
+                st.info(f"**현재가:** {current_price:,} 원")
+                st.success(f"**달성조건:** {matched_conds}")
+                st.error(f"**최근 고점 대비:** {drop}")
+                st.markdown(f"""
+                **💡 영웅문S# 실전 팁**
+                * 코스닥 주도주(거래대금 상위) 중 차트가 눌린 종목만 1차로 필터링했습니다.
+                * 하단 거래량 막대가 바닥에 붙어있고, **외인/기관(매수)** 딱지가 붙은 종목이 최우선 공략 대상입니다.
+                """)
         else:
-            st.warning("현재 종합 조건을 충족하는 종목이 없습니다.")
+            st.warning("현재 최소 기준 점수(30점)를 만족하는 주식이 없습니다.")
