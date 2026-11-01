@@ -112,3 +112,51 @@ def draw_chart(ticker, ticker_name):
     
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['STD_20'] = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['SMA_20'] + (df['STD_20'] * 2)
+    df['BB_Lower'] = df['SMA_20'] - (df['STD_20'] * 2)
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='주가', increasing_line_color='red', decreasing_line_color='blue'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], line=dict(color='gray', width=1, dash='dot')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], line=dict(color='gray', width=1, dash='dot'), fill='tonexty', fillcolor='rgba(128,128,128,0.1)'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], line=dict(color='orange', width=2), name='20일선'), row=1, col=1)
+    
+    colors = ['red' if df['Close'].iloc[i] > df['Open'].iloc[i] else 'blue' for i in range(len(df))]
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='거래량'), row=2, col=1)
+    
+    fig.update_layout(title=f"📈 {ticker_name} ({ticker}) 스윙 타점 차트", yaxis_title="가격 (원)", yaxis2_title="거래량", xaxis_rangeslider_visible=False, height=550, template="plotly_white", margin=dict(l=0, r=0, t=40, b=0), showlegend=False)
+    return fig
+
+st.title("🎯 코스피/코스닥 스윙 타점 & 매집 통합 스크리너")
+st.markdown("양대 시장 거래대금 상위 250개 주도주 중, **급등 후 거래량이 씨가 마른 눌림목과 외인/기관의 매집**을 추적합니다.")
+
+if st.button("스윙 & 매집 주식 탐지 시작", type="primary"):
+    st.session_state['run_screener'] = True
+
+if st.session_state.get('run_screener', False):
+    universe_df = get_market_universe()
+    if not universe_df.empty:
+        result_df = run_stock_swing_screener(universe_df)
+        if not result_df.empty:
+            st.dataframe(result_df.style.highlight_max(axis=0, subset=['종합점수'], color='#ff4b4b').format({"현재가": "{:,}"}), use_container_width=True)
+            
+            stock_options = [f"{row['종목명']} ({row['종목코드']})" for i, row in result_df.iterrows()]
+            selected_stock = st.selectbox("정밀 차트 분석 (거래량 확인):", stock_options)
+            
+            sel_name = selected_stock.split(" (")[0]
+            sel_code = selected_stock.split(" (")[1].replace(")", "")
+            
+            current_price = result_df[result_df['종목코드'] == sel_code]['현재가'].values[0]
+            drop = result_df[result_df['종목코드'] == sel_code]['고점대비하락'].values[0]
+            matched_conds = result_df[result_df['종목코드'] == sel_code]['만족조건'].values[0]
+            market_type = result_df[result_df['종목코드'] == sel_code]['시장'].values[0]
+            
+            col1, col2 = st.columns([3, 1])
+            with col1: st.plotly_chart(draw_chart(sel_code, sel_name), use_container_width=True)
+            with col2: 
+                st.info(f"**현재가:** {current_price:,} 원")
+                st.success(f"**달성조건:** {matched_conds}")
+                st.warning(f"**소속시장:** {market_type}")
+                st.error(f"**최근 고점 대비:** {drop}")
+        else:
+            st.warning("현재 최소 기준 점수(30점)를 만족하는 주식이 없습니다.")
