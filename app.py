@@ -13,9 +13,10 @@ st.set_page_config(layout="wide", page_title="국내주식 스윙 타점 & 매�
 @st.cache_data(ttl=300)
 def get_market_universe():
     try:
-        # KRX(코스피+코스닥) 전체 시장에서 거래대금 상위 250종목 추출
+        # [핵심 수정] 오늘 거래대금(Amount)이 아닌 '시가총액(Marcap)' 상위 300대 우량주 추출
+        # (거래량이 죽어있는 눌림목을 찾기 위한 올바른 필터링)
         df = fdr.StockListing('KRX')
-        return df.sort_values(by="Amount", ascending=False).head(250)
+        return df.sort_values(by="Marcap", ascending=False).head(300)
     except:
         return pd.DataFrame()
 
@@ -38,7 +39,7 @@ def get_naver_supply(ticker):
 @st.cache_data(ttl=300)
 def run_stock_swing_screener(universe_df):
     temp_results = []
-    progress_text = "코스피/코스닥 스윙 눌림목 및 수급 스캔 중..."
+    progress_text = "코스피/코스닥 우량주 스윙 눌림목 스캔 중..."
     my_bar = st.progress(0, text=progress_text)
     
     start_date = (datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d")
@@ -65,7 +66,8 @@ def run_stock_swing_screener(universe_df):
             price_trend = (recent_10['Close'].iloc[-1] - recent_10['Close'].iloc[0]) / recent_10['Close'].iloc[0]
             obv_trend = recent_10['OBV'].iloc[-1] > recent_10['OBV'].iloc[0]
             
-            is_bb_squeeze = latest['Band_Width'] < 0.15
+            # 주식 시장에 맞게 밴드폭 약간 완화 (0.15 -> 0.18)
+            is_bb_squeeze = latest['Band_Width'] < 0.18
             is_obv_accum = price_trend <= 0.05 and obv_trend
             
             peak_high = recent_30['High'].max()
@@ -74,7 +76,8 @@ def run_stock_swing_screener(universe_df):
             drop_rate = (latest['Close'] - peak_high) / peak_high if peak_high > 0 else 0
             vol_dry_rate = latest['Volume'] / peak_vol if peak_vol > 0 else 1
             
-            is_swing_dip = (-0.40 <= drop_rate <= -0.10) and (vol_dry_rate < 0.25) and (latest['Close'] > latest['SMA_20'] * 0.85)
+            # 스윙 타점: -10%~-40% 하락, 거래량 30% 이하로 마름
+            is_swing_dip = (-0.40 <= drop_rate <= -0.10) and (vol_dry_rate < 0.30) and (latest['Close'] > latest['SMA_20'] * 0.85)
             
             score = 0
             matched = []
@@ -83,6 +86,7 @@ def run_stock_swing_screener(universe_df):
             if is_bb_squeeze: matched.append("BB밀집"); score += 20
             if is_obv_accum: matched.append("OBV매집"); score += 20
             
+            # 점수가 20점 이상일 때만 네이버 수급 확인 (크롤링 과부하 방지)
             if score >= 20:
                 f_net, i_net = get_naver_supply(ticker)
                 if f_net > 0: matched.append("외인(매수)"); score += 15
@@ -99,7 +103,9 @@ def run_stock_swing_screener(universe_df):
                     "종합점수": score
                 })
         except: pass
-        time.sleep(0.01)
+        
+        # [핵심 수정] 네이버/FDR API 차단 방지를 위해 딜레이 증가 (0.01 -> 0.1)
+        time.sleep(0.1)
         my_bar.progress((i + 1) / len(tickers), text=progress_text)
         
     my_bar.empty()
@@ -128,7 +134,7 @@ def draw_chart(ticker, ticker_name):
     return fig
 
 st.title("🎯 코스피/코스닥 스윙 타점 & 매집 통합 스크리너")
-st.markdown("양대 시장 거래대금 상위 250개 주도주 중, **급등 후 거래량이 씨가 마른 눌림목과 외인/기관의 매집**을 추적합니다.")
+st.markdown("양대 시장 시가총액 상위 300대 우량주 중, **급등 후 거래량이 씨가 마른 눌림목과 외인/기관의 매집**을 추적합니다.")
 
 if st.button("스윙 & 매집 주식 탐지 시작", type="primary"):
     st.session_state['run_screener'] = True
@@ -159,4 +165,4 @@ if st.session_state.get('run_screener', False):
                 st.warning(f"**소속시장:** {market_type}")
                 st.error(f"**최근 고점 대비:** {drop}")
         else:
-            st.warning("현재 최소 기준 점수(30점)를 만족하는 주식이 없습니다.")
+            st.warning("현재 최소 기준 점수(30점)를 만족하는 주식이 없습니다. (전체 하락장 유력)")
