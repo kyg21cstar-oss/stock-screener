@@ -6,6 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 import io
 import time
+import concurrent.futures
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -15,12 +16,10 @@ st.set_page_config(layout="wide", page_title="20년차 애널리스트: 정통 �
 def get_market_universe():
     try:
         df = fdr.StockListing('KRX')
-        # [핵심 속도 최적화] 우선주(코드가 0으로 안 끝남), 스팩주, 리츠 등 쓰레기 종목 사전 제거
         df = df[df['Code'].str.endswith('0')]
         df = df[~df['Name'].str.contains('스팩|리츠')]
-        
-        # 전체 2500개 중 의미 있는 500억 자금이 들어올 수 있는 시가총액 상위 800개로 압축 (약 1~2분 컷)
-        return df.sort_values(by="Marcap", ascending=False).head(800)
+        # 시총 상위 300대 우량주로 압축하여 속도 및 종목 퀄리티 극대화
+        return df.sort_values(by="Marcap", ascending=False).head(300)
     except:
         return pd.DataFrame()
 
@@ -66,63 +65,73 @@ def check_fundamentals(ticker):
     except:
         return False
 
+def process_ticker(args):
+    """개별 종목을 분석하는 독립 함수 (병렬 처리용)"""
+    ticker, name, market, start_date = args
+    try:
+        df = fdr.DataReader(ticker, start_date)
+        if len(df) < 15: return None
+        
+        recent_14 = df.tail(14).copy()
+        latest = df.iloc[-1]
+        
+        recent_14['Amount'] = recent_14['Close'] * recent_14['Volume']
+        peak_idx = recent_14['Amount'].idxmax()
+        peak_candle = df.loc[peak_idx]
+        
+        if peak_idx == df.index[-1]: return None
+        
+        # [핵심 수정] 500억 -> 300억 이상으로 기준 완화
+        is_huge_volume = peak_candle['Amount'] >= 30000000000
+        is_long_body = peak_candle['Close'] >= (peak_candle['Open'] * 1.10)
+        
+        if not (is_huge_volume and is_long_body): return None
+            
+        peak_open = peak_candle['Open']
+        peak_close = peak_candle['Close']
+        mid_price = (peak_open + peak_close) / 2
+        
+        is_at_midline = (mid_price * 0.95 <= latest['Close'] <= mid_price * 1.05)
+        
+        if is_at_midline:
+            if check_fundamentals(ticker):
+                return {
+                    "종목코드": ticker,
+                    "종목명": name,
+                    "시장": market,
+                    "현재가": int(latest['Close']),
+                    "중심선(1/2)": int(mid_price),
+                    "기준봉대금": f"{int(peak_candle['Amount'] / 100000000)}억",
+                    "달성조건": "⭐300억 중심선 & 재무통과"
+                }
+    except:
+        pass
+    return None
+
 @st.cache_data(ttl=600)
-def run_analyst_screener(universe_df):
+def run_analyst_screener_fast(universe_df):
     temp_results = []
-    progress_text = "상위 800개 핵심 종목 차트 및 재무 건전성 분석 중... (약 1~2분 소요)"
+    progress_text = "⚡ 초고속 멀티스레딩 스캔 중... (약 10~20초 소요)"
     my_bar = st.progress(0, text=progress_text)
     
     start_date = (datetime.today() - timedelta(days=60)).strftime("%Y-%m-%d")
-    tickers, names, markets = universe_df['Code'].tolist(), universe_df['Name'].tolist(), universe_df['Market'].tolist()
     
-    for i, ticker in enumerate(tickers):
-        try:
-            df = fdr.DataReader(ticker, start_date)
-            if len(df) < 15: continue
-            
-            recent_14 = df.tail(14).copy()
-            latest = df.iloc[-1]
-            
-            recent_14['Amount'] = recent_14['Close'] * recent_14['Volume']
-            
-            peak_idx = recent_14['Amount'].idxmax()
-            peak_candle = df.loc[peak_idx]
-            
-            if peak_idx == df.index[-1]: continue
-            
-            is_huge_volume = peak_candle['Amount'] >= 50000000000
-            is_long_body = peak_candle['Close'] >= (peak_candle['Open'] * 1.10)
-            
-            if not (is_huge_volume and is_long_body):
-                continue
-                
-            peak_open = peak_candle['Open']
-            peak_close = peak_candle['Close']
-            mid_price = (peak_open + peak_close) / 2
-            
-            is_at_midline = (mid_price * 0.95 <= latest['Close'] <= mid_price * 1.05)
-            
-            if is_at_midline:
-                if check_fundamentals(ticker):
-                    temp_results.append({
-                        "종목코드": ticker,
-                        "종목명": names[i],
-                        "시장": markets[i],
-                        "현재가": int(latest['Close']),
-                        "중심선(1/2)": int(mid_price),
-                        "기준봉대금": f"{int(peak_candle['Amount'] / 100000000)}억",
-                        "달성조건": "⭐500억 중심선 & 재무통과"
-                    })
-        except: pass
+    tasks = [(row['Code'], row['Name'], row['Market'], start_date) for _, row in universe_df.iterrows()]
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(process_ticker, task) for task in tasks]
         
-        # 딜레이를 최소화하여 분석 속도 극대화
-        time.sleep(0.01)
-        if i % 5 == 0:
-            my_bar.progress((i + 1) / len(tickers), text=progress_text)
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            result = future.result()
+            if result:
+                temp_results.append(result)
             
+            if i % 10 == 0 or i == len(tasks) - 1:
+                my_bar.progress((i + 1) / len(tasks), text=progress_text)
+                
     my_bar.empty()
     if not temp_results: return pd.DataFrame()
-    return pd.DataFrame(temp_results)
+    return pd.DataFrame(temp_results).sort_values(by="기준봉대금", ascending=False)
 
 def draw_chart(ticker, ticker_name):
     start_date = (datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d")
@@ -148,7 +157,7 @@ def draw_chart(ticker, ticker_name):
     return fig
 
 st.title("💼 20년차 애널리스트: 정통 기준봉 중심선 스크리너")
-st.markdown("**[차트 1차]** 우량주 800개 대상 14일 내 500억 & 10% 이상 터진 장대양봉의 1/2 중심선 지지 포착<br>**[재무 2차]** 3년 연속 적자 기업 원천 차단 및 유보율이 부채비율보다 높은 기업 선별", unsafe_allow_html=True)
+st.markdown("**[차트 1차]** 우량주 300개 대상 14일 내 **300억** & 10% 이상 터진 장대양봉의 1/2 중심선 지지 포착<br>**[재무 2차]** 3년 연속 적자 기업 원천 차단 및 유보율이 부채비율보다 높은 우량 기업 선별<br>⚡ **멀티스레딩(병렬 처리) 가속 엔진 탑재 완료**", unsafe_allow_html=True)
 
 if st.button("우량주 중심선 스윙 탐지 시작", type="primary"):
     st.session_state['run_screener'] = True
@@ -156,7 +165,7 @@ if st.button("우량주 중심선 스윙 탐지 시작", type="primary"):
 if st.session_state.get('run_screener', False):
     universe_df = get_market_universe()
     if not universe_df.empty:
-        result_df = run_analyst_screener(universe_df)
+        result_df = run_analyst_screener_fast(universe_df)
         if not result_df.empty:
             st.dataframe(result_df.style.format({"현재가": "{:,}", "중심선(1/2)": "{:,}"}), use_container_width=True)
             
@@ -179,8 +188,8 @@ if st.session_state.get('run_screener', False):
                 st.success("**재무 상태:** 건전 (적자 X, 비상금 > 빚)")
                 st.markdown("""
                 **💡 애널리스트 실전 가이드**
-                * 500억 이상의 자금은 개인이 절대 만들 수 없는 '기관/외인'의 발자국입니다.
-                * 재무 건전성(유보율>부채)이 확보되었으므로, **초록색 중심선**에서 분할 매수 시 편안하게 수익을 낼 수 있습니다.
+                * 300억 이상의 자금은 개인이 절대 만들 수 없는 '기관/외인/큰손'의 발자국입니다.
+                * 재무 건전성(유보율>부채)이 확보되었으므로, **초록색 중심선**에서 편안하게 스윙 매매를 진행하세요.
                 """)
         else:
-            st.warning("현재 까다로운 500억 중심선 차트 조건과 재무 건전성을 동시에 만족하는 종목이 없습니다.")
+            st.warning("현재 까다로운 300억 중심선 차트 조건과 재무 건전성을 동시에 만족하는 종목이 없습니다. (장이 눌리는 중)")
