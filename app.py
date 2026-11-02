@@ -8,7 +8,7 @@ import time
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-st.set_page_config(layout="wide", page_title="국내주식 스윙 타점(기준봉 시초가) 스크리너")
+st.set_page_config(layout="wide", page_title="국내주식 스윙 타점(기준봉 중심선) 스크리너")
 
 @st.cache_data(ttl=300)
 def get_market_universe():
@@ -37,7 +37,7 @@ def get_naver_supply(ticker):
 @st.cache_data(ttl=300)
 def run_stock_swing_screener(universe_df):
     temp_results = []
-    progress_text = "기준봉 시초가 눌림목 및 수급 스캔 중..."
+    progress_text = "기준봉 중심선(절반) 눌림목 및 수급 스캔 중..."
     my_bar = st.progress(0, text=progress_text)
     
     start_date = (datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d")
@@ -46,31 +46,33 @@ def run_stock_swing_screener(universe_df):
     for i, ticker in enumerate(tickers):
         try:
             df = fdr.DataReader(ticker, start_date)
-            if len(df) < 30: continue
+            if len(df) < 20: continue
             
-            recent_30 = df.tail(30)
+            # [핵심 로직 수정] 최근 2주(14일) 내 10% 이상 장대양봉 중심선 지지
+            recent_14 = df.tail(14)
             latest = df.iloc[-1]
             
-            # [핵심 로직 수정] 기준봉(대량 거래일) 시초가 지지 확인
-            # 1. 최근 30일 중 거래량이 가장 많이 터진 날(기준봉) 찾기
-            peak_vol_idx = recent_30['Volume'].idxmax()
+            peak_vol_idx = recent_14['Volume'].idxmax()
             peak_candle = df.loc[peak_vol_idx]
             
-            # 기준봉이 양봉(시가보다 종가가 5% 이상 상승)이었는지 확인
-            is_valid_peak = peak_candle['Close'] > (peak_candle['Open'] * 1.05)
+            # 1. 10% 이상 장대양봉 조건
+            is_valid_peak = peak_candle['Close'] >= (peak_candle['Open'] * 1.10)
             
-            # 2. 현재 가격이 기준봉의 '시초가(Open)' 부근인지 확인 (-5% ~ +15% 구간)
+            # 2. 중심선(절반) 가격 계산
             peak_open = peak_candle['Open']
-            is_price_retraced = (peak_open * 0.95 <= latest['Close'] <= peak_open * 1.15)
+            peak_close = peak_candle['Close']
+            mid_price = (peak_open + peak_close) / 2
             
-            # 3. 거래량 마름 확인: 현재 거래량이 기준봉 거래량의 25% 이하인지
+            # 3. 현재가가 시초가와 중심선(절반) 부근 사이에서 지지받고 있는지
+            is_price_retraced = (peak_open * 0.95 <= latest['Close'] <= mid_price * 1.05)
+            
+            # 4. 거래량 극감: 장대양봉 당일 거래량 대비 30% 이하
             vol_dry_rate = latest['Volume'] / peak_candle['Volume'] if peak_candle['Volume'] > 0 else 1
-            is_vol_dried = vol_dry_rate < 0.25
+            is_vol_dried = vol_dry_rate < 0.30
             
-            # 위 3가지가 모두 맞아야 진짜 '시초가 지지 스윙(눌림목)'으로 인정
             is_swing_dip = is_valid_peak and is_price_retraced and is_vol_dried
             
-            # 보조 지표 계산
+            # 보조 지표
             df['SMA_20'] = df['Close'].rolling(window=20).mean()
             df['STD_20'] = df['Close'].rolling(window=20).std()
             df['BB_Upper'] = df['SMA_20'] + (df['STD_20'] * 2)
@@ -90,7 +92,7 @@ def run_stock_swing_screener(universe_df):
             score = 0
             matched = []
             
-            if is_swing_dip: matched.append("⭐기준봉시초가(눌림)"); score += 30
+            if is_swing_dip: matched.append("⭐장대양봉 중심선"); score += 40
             if is_bb_squeeze: matched.append("BB밀집"); score += 20
             if is_obv_accum: matched.append("OBV매집"); score += 20
             
@@ -99,14 +101,16 @@ def run_stock_swing_screener(universe_df):
                 if f_net > 0: matched.append("외인(매수)"); score += 15
                 if i_net > 0: matched.append("기관(매수)"); score += 15
             
-            if score >= 30:
+            # 기술적 타점(중심선, BB, OBV) 중 1개 이상 획득 시 표출
+            has_technical = is_swing_dip or is_bb_squeeze or is_obv_accum
+            if score >= 30 and has_technical:
                 temp_results.append({
                     "종목코드": ticker,
                     "종목명": names[i],
                     "시장": markets[i],
                     "만족조건": ", ".join(matched),
                     "현재가": int(latest['Close']),
-                    "기준봉시초가": int(peak_open),
+                    "중심선가격": int(mid_price),
                     "종합점수": score
                 })
         except: pass
@@ -129,23 +133,25 @@ def draw_chart(ticker, ticker_name):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='주가', increasing_line_color='red', decreasing_line_color='blue'), row=1, col=1)
     
-    # 기준봉 시초가를 차트에 표시하기 위해 최근 30일 데이터 다시 계산
-    recent_30 = df.tail(30)
-    peak_vol_idx = recent_30['Volume'].idxmax()
+    # 최근 14일 내 최대 거래량 기준봉 탐색 및 중심선 표시
+    recent_14 = df.tail(14)
+    peak_vol_idx = recent_14['Volume'].idxmax()
     peak_open = df.loc[peak_vol_idx, 'Open']
+    peak_close = df.loc[peak_vol_idx, 'Close']
+    mid_price = (peak_open + peak_close) / 2
     
-    # 가로선(기준봉 시초가 방어선) 추가
-    fig.add_hline(y=peak_open, line_dash="dot", line_color="green", annotation_text="기준봉 시초가 (세력 방어선)", annotation_position="bottom right")
+    # 가로선(중심선) 추가
+    fig.add_hline(y=mid_price, line_dash="dot", line_color="green", annotation_text="기준봉 1/2 중심선 (세력 방어선)", annotation_position="bottom right")
     
     fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], line=dict(color='orange', width=2), name='20일선'), row=1, col=1)
     colors = ['red' if df['Close'].iloc[i] > df['Open'].iloc[i] else 'blue' for i in range(len(df))]
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='거래량'), row=2, col=1)
     
-    fig.update_layout(title=f"📈 {ticker_name} ({ticker}) 기준봉 시초가 눌림목 차트", yaxis_title="가격 (원)", yaxis2_title="거래량", xaxis_rangeslider_visible=False, height=550, template="plotly_white", margin=dict(l=0, r=0, t=40, b=0), showlegend=False)
+    fig.update_layout(title=f"📈 {ticker_name} ({ticker}) 기준봉 중심선 눌림목 차트", yaxis_title="가격 (원)", yaxis2_title="거래량", xaxis_rangeslider_visible=False, height=550, template="plotly_white", margin=dict(l=0, r=0, t=40, b=0), showlegend=False)
     return fig
 
-st.title("🎯 주식 스윙 타점(기준봉 시초가) & 매집 스크리너")
-st.markdown("시가총액 300대 우량주 중, **과거 대량 거래량으로 급등했던 기준봉의 '시초가' 부근까지 거래량 없이 조정을 받고 지지하는 진짜 눌림목**을 추적합니다.")
+st.title("🎯 주식 스윙 타점(기준봉 중심선) 스크리너")
+st.markdown("시가총액 300대 우량주 중, **최근 2주 내 10% 이상 급등한 장대양봉의 '절반(중심선)' 부근까지 거래량 없이 조정을 받은 종목**을 추적합니다.")
 
 if st.button("스윙 & 매집 주식 탐지 시작", type="primary"):
     st.session_state['run_screener'] = True
@@ -155,7 +161,7 @@ if st.session_state.get('run_screener', False):
     if not universe_df.empty:
         result_df = run_stock_swing_screener(universe_df)
         if not result_df.empty:
-            st.dataframe(result_df.style.highlight_max(axis=0, subset=['종합점수'], color='#ff4b4b').format({"현재가": "{:,}", "기준봉시초가": "{:,}"}), use_container_width=True)
+            st.dataframe(result_df.style.highlight_max(axis=0, subset=['종합점수'], color='#ff4b4b').format({"현재가": "{:,}", "중심선가격": "{:,}"}), use_container_width=True)
             
             stock_options = [f"{row['종목명']} ({row['종목코드']})" for i, row in result_df.iterrows()]
             selected_stock = st.selectbox("정밀 차트 분석 (초록색 방어선 확인):", stock_options)
@@ -164,19 +170,21 @@ if st.session_state.get('run_screener', False):
             sel_code = selected_stock.split(" (")[1].replace(")", "")
             
             current_price = result_df[result_df['종목코드'] == sel_code]['현재가'].values[0]
-            peak_open = result_df[result_df['종목코드'] == sel_code]['기준봉시초가'].values[0]
+            mid_price = result_df[result_df['종목코드'] == sel_code]['중심선가격'].values[0]
             matched_conds = result_df[result_df['종목코드'] == sel_code]['만족조건'].values[0]
+            market_type = result_df[result_df['종목코드'] == sel_code]['시장'].values[0]
             
             col1, col2 = st.columns([3, 1])
             with col1: st.plotly_chart(draw_chart(sel_code, sel_name), use_container_width=True)
             with col2: 
                 st.info(f"**현재가:** {current_price:,} 원")
-                st.warning(f"**기준봉 시초가:** {peak_open:,} 원")
+                st.warning(f"**중심선 가격:** {mid_price:,} 원")
                 st.success(f"**달성조건:** {matched_conds}")
+                st.error(f"**소속시장:** {market_type}")
                 st.markdown("""
-                **💡 기준봉 매매 팁**
-                * 차트의 **초록색 점선**이 세력이 돈을 쓰기 시작한 방어선(시초가)입니다.
-                * 주가가 이 선을 깨지 않고 버티면서 거래량이 죽어있다면 완벽한 매수 타점입니다.
+                **💡 중심선 매매 팁**
+                * 차트의 **초록색 점선**이 세력이 돈을 쓴 장대양봉의 1/2 지점(중심선)입니다.
+                * 주가가 이 선 부근에서 하락을 멈추고 거래량이 급감했다면 세력이 이탈하지 않고 물량을 소화 중이라는 뜻입니다.
                 """)
         else:
             st.warning("현재 최소 기준 점수(30점)를 만족하는 주식이 없습니다.")
